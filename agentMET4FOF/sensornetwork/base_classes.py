@@ -8,7 +8,8 @@ from agentMET4FOF.agents.metrological_signal_agents import MetrologicalGenerator
 from agentMET4FOF.network import AgentNetwork
 from agentMET4FOF.streams.metrological_base_streams import MetrologicalDataStreamMET4FOF
 
-df_heatmeter = pd.read_csv("C://Users//vedurm01//Documents/FunSNM//A413//measurementsTimetable.txt")
+
+df_heatmeter = pd.read_csv("C://Users//singh04//Desktop//measurementsTimetable.txt")
 df_heatmeter_dict = {}
 unique_meter_array = df_heatmeter['Meter'].unique()
 for k in unique_meter_array:
@@ -19,30 +20,20 @@ df_heatmeter_multiindex = pd.concat(df_heatmeter_dict)
 df_heatmeter_multiindex.index = pd.MultiIndex.from_tuples(df_heatmeter_multiindex.index)
 df_heatmeter_multiindex.index.names = ['Meter', 'Timestamp']
 
+
 class SensorOnPlatform(MetrologicalDataStreamMET4FOF):
-    """Streaming data from a sensor located on a specified platform
-
-    Parameters
-    ----------
-    platform_name : str, optional
-        name of the platform on which the sensing unit is located
-    uncertainty : float
-        frequency of wave function, defaults to 50.0
-    output_unit : str
-        SI unit of the sensor output
-    sensor_type : str, optional
-        type of sensor based on what is being measured
-    data_stream : Union[List, DataFrame, np.ndarray]
-        data stream of sensor measurements indexed by time, e.g. timestamps
-    """
-
     def __init__(
-        self, uncertainty: float =0, platform_name=None, sensor_type=None, output_unit=None, data_stream: Union[List, pd.DataFrame, np.ndarray]=None
+        self, uncertainty: float =0, platform_name=None, sensor_type=None,
+        output_unit=None, data_stream: Union[List, pd.DataFrame, np.ndarray]=None
     ):
         self.uncertainty = uncertainty
         self.output_unit = output_unit
         self.platform = platform_name
         self.sensor_type = sensor_type
+
+        # store data_stream directly for later use
+        self.data_stream = data_stream  
+
         super(SensorOnPlatform, self).__init__(value_unc=self.uncertainty, time_unc=0)
         self.set_metadata(
             self.platform+'_'+data_stream.columns.values[0],
@@ -55,30 +46,36 @@ class SensorOnPlatform(MetrologicalDataStreamMET4FOF):
         self.set_data_source(quantities=data_stream, time=pd.DataFrame(data_stream.index.values))
 
 
-class SensorPlatform(MetrologicalAgent):
-    """A metrological agent representing a platform hosting one or more sensors in an IoT network
-     """
 
-    def init_parameters(self):
-        """Initialize the sensor agent
+# NEW CLASS: MultiSensorOnPlatform
+# This is the key change: combines multiple SensorOnPlatform objects
+# into a single signal stream for one agent
+# -------------------------------------------------------------------
 
-         Parameters
-         -----------
-          uncertainty: np.float
-            The uncertainty of the sensor determined via a calibration
-          position: Union[Tuple[np.float, np.float], str]
-            The location of the sensor  given either by explicit geographical coordinates or a string descriptor
-         """
+class MultiSensorOnPlatform(MetrologicalDataStreamMET4FOF):
+    """Handles multiple sensors on the same platform as a single stream."""
+    def __init__(self, sensors: List[SensorOnPlatform]):
+        self.sensors = sensors
+        self.uncertainty = np.mean([s.uncertainty for s in sensors])
+        super().__init__(value_unc=self.uncertainty, time_unc=0)
 
-        super().init_parameters()
-        self.position = None
-        self.output_unit = None
-        self._stream = SensorOnPlatform(uncertainty=.01, platform_name="Heat Meter", sensor_type='Temperature', output_unit='°C',
-                                        data_stream=df_heatmeter_multiindex.loc[11]['tempLow'])
+        # Combine metadata
+        self.set_metadata(
+            "HeatMeterAgent", "time", "h", "Temperature", "°C",
+            "Combined data from multiple sensors"
+        )
 
-    @property
-    def device_id(self):
-        return self._stream.metadata.metadata["device_id"]
+        # Combine all quantities into a single DataFrame
+        quantities_list = [s.data_stream for s in sensors]  # use stored data_stream
+        quantities = pd.concat(quantities_list, axis=1)
+        quantities.columns = [s.metadata.metadata['device_id'] for s in sensors]
+
+        # Use time index from first sensor
+        times = pd.DataFrame(sensors[0].data_stream.index)
+        self.set_data_source(quantities=quantities, time=times)
+        
+
+
 
 def demonstrate_metrological_stream():
     """Demonstrate an agent network with two metrologically enabled agents
@@ -97,25 +94,28 @@ def demonstrate_metrological_stream():
     # start agent network server
     agent_network = AgentNetwork(dashboard_modules=True, ip_addr='127.0.0.1')
 
-    # Initialize metrologically enabled agent with a multiwave (sum of cosines)
-    # generator as signal source taking name from signal source metadata.
-    signal_heatmeter_tempLow = SensorOnPlatform(uncertainty=1.5, platform_name='HeatMeter', sensor_type='Temperature',
-                                            output_unit='°C', data_stream=df_heatmeter_multiindex.loc[11][['tempLow']])
-    signal_heatmeter_tempHigh = SensorOnPlatform(uncertainty=1.0, platform_name='HeatMeter', sensor_type='Temperature',
-                                                output_unit='°C',
-                                                data_stream=df_heatmeter_multiindex.loc[11][['tempHigh']])
-
-    source_name_tempLow = signal_heatmeter_tempLow.metadata.metadata["device_id"]
-    source_agent_tempLow = agent_network.add_agent(
-        name=source_name_tempLow, agentType=MetrologicalGeneratorAgent
+    # Initialize two SensorOnPlatform objects (low and high temperature)
+    signal_tempLow = SensorOnPlatform(
+        uncertainty=1.5, platform_name='HeatMeter', sensor_type='Temperature',
+        output_unit='°C', data_stream=df_heatmeter_multiindex.loc[11][['tempLow']]
     )
-    source_agent_tempLow.init_parameters(signal=signal_heatmeter_tempLow)
-
-    source_name_tempHigh = signal_heatmeter_tempHigh.metadata.metadata["device_id"]
-    source_agent_tempHigh = agent_network.add_agent(
-        name=source_name_tempHigh, agentType=MetrologicalGeneratorAgent
+    signal_tempHigh = SensorOnPlatform(
+        uncertainty=1.0, platform_name='HeatMeter', sensor_type='Temperature',
+        output_unit='°C', data_stream=df_heatmeter_multiindex.loc[11][['tempHigh']]
     )
-    source_agent_tempHigh.init_parameters(signal=signal_heatmeter_tempHigh)
+
+    # -------------------------------------------------------------------
+    # Key Change: Combine the two sensors into a single MultiSensorOnPlatform
+    # -------------------------------------------------------------------
+    combined_sensor = MultiSensorOnPlatform([signal_tempLow, signal_tempHigh])
+
+
+  # Create a single MetrologicalGeneratorAgent to handle both sensors
+    combined_agent = agent_network.add_agent(
+        name="HeatMeterAgent",
+        agentType=MetrologicalGeneratorAgent
+    )
+    combined_agent.init_parameters(signal=combined_sensor)  # pass single combined signal
 
 
     # Initialize metrologically enabled plotting agent.
@@ -125,15 +125,14 @@ def demonstrate_metrological_stream():
         buffer_size=50,
     )
 
-    # Bind agents.
-    source_agent_tempLow.bind_output(monitor_agent)
-    source_agent_tempHigh.bind_output(monitor_agent)
+     # Bind the combined agent to the monitor
+    combined_agent.bind_output(monitor_agent)
 
-    # Set all agents states to "Running".
+    # Set all agents to running
     agent_network.set_running_state()
 
-    # Allow for shutting down the network after execution.
     return agent_network
+
 
 
 if __name__ == "__main__":
