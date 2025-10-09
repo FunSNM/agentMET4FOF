@@ -47,7 +47,7 @@ class SensorOnPlatform(MetrologicalDataStreamMET4FOF):
 
 
 
-# NEW CLASS: MultiSensorOnPlatform
+# NEW CLASS: MultiSensorOnPlatform for hanling multiple sensors
 # This is the key change: combines multiple SensorOnPlatform objects
 # into a single signal stream for one agent
 # -------------------------------------------------------------------
