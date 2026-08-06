@@ -840,6 +840,7 @@ class Dashboard_agt_net(Dashboard_Layout_Base):
                         "legend": dict(
                             xanchor="auto", yanchor="bottom", x=1, y=1, orientation="h"
                         ),
+                    "font": {"size": 25},
                         # 'margin':dict(t=150)
                     },
                 }
