@@ -79,8 +79,10 @@ class MetrologicalAgent(AgentMET4FOF):
         # 2. Append metadata if provided
         elif metadata is not None:
             # Since we guaranteed metadata is a list during initialization,
-            # we can safely call .append()
-            self._output_data[channel]["metadata"].append(metadata)
+            # we can safely call .append() after checking if identical metadata object is not already present
+            # to avoid resending metadata
+            if metadata not in self._output_data[channel]["metadata"]:
+                self._output_data[channel]["metadata"].append(metadata)
 
         # 3. Append received data
         if data is not None:
