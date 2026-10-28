@@ -101,15 +101,11 @@ class ConsensusAgent(MetrologicalAgent):
 
         ## check 1: buffer len is the same
         if len(buffer_values) == n_input_agents:
-            connectivity_matrix = self.update_connectivity_matrix(buffer_values)
+            self.update_connectivity_matrix(buffer_values)
+            self.reputations = self.update_reputations(buffer_values)
             self.buffer.clear()
 
     def generate_connectivity_matrix(self):
-        rooms_on_floor = self.floor_serialization if isinstance(self.floor_serialization,
-                                                       list) else self.floor_serialization.get('zones', [])
-
-        # 1. Get a list of all unique room IDs to define the matrix dimensions
-        room_ids = sorted([room['guid'] for room in rooms_on_floor])
 
         connectivity_matrix = None
         sensor_platforms = []
@@ -151,7 +147,6 @@ class ConsensusAgent(MetrologicalAgent):
 
         for room in rooms:
             u_id = room['guid']
-            u_idx = id_to_idx[u_id]
             sensor_platforms_in_room = [device for device, range in self.device_map[u_id].items() if
                                         'airvolume' in range]
             for wall in room.get('walls', []):
@@ -161,8 +156,6 @@ class ConsensusAgent(MetrologicalAgent):
                                                 'airvolume' in range]
 
                     if v_id in id_to_idx:
-                        v_idx = id_to_idx[v_id]
-
                         # Get the list of doors in this shared wall section [1]
                         doors = neighbour.get('door_ids_in_section', [])
 
@@ -176,15 +169,9 @@ class ConsensusAgent(MetrologicalAgent):
                             is_any_door_open = any(door_states.get(d_id, 0) != 2 for d_id in doors)
                             weight = 1.0 if is_any_door_open else 0.5
 
-                        matrix[u_idx][v_idx] = weight
-                        matrix[v_idx][u_idx] = weight
-                        self.connectivity_matrix.loc[sensor_platforms_in_room][sensor_platforms_in_neighbour] = weight
-                        self.connectivity_matrix.loc[sensor_platforms_in_neighbour][sensor_platforms_in_room] = weight
+                        self.connectivity_matrix.loc[sensor_platforms_in_room,sensor_platforms_in_neighbour] = weight
+                        self.connectivity_matrix.loc[sensor_platforms_in_neighbour,sensor_platforms_in_room] = weight
 
-        # Convert to DataFrame for better readability
-        np.fill_diagonal(matrix, 1)
-        connectivity_df = pd.DataFrame(matrix, index=room_ids, columns=room_ids)
-        return connectivity_df
 
     def update_reputations(self, buffer_values):
         reputation_weights = self.reputations
