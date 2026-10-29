@@ -89,8 +89,6 @@ class ConsensusAgent(MetrologicalAgent):
         #number of input agents that are connected to the aggregator
         n_input_agents = len(self.get_attr("Inputs"))
 
-        if self.reputations is None:
-            self.reputations = np.ones(n_input_agents)
         # store into buffer
 
         self.buffer.store(message["from"], {'data':message["data"], 'metadata':message["metadata"]})
@@ -141,9 +139,6 @@ class ConsensusAgent(MetrologicalAgent):
         # 1. Get a list of all unique room IDs to define the matrix dimensions
         room_ids = sorted([room['guid'] for room in rooms])
         id_to_idx = {room_id: i for i, room_id in enumerate(room_ids)}
-        num_rooms = len(room_ids)
-
-        matrix = np.zeros((num_rooms, num_rooms))
 
         for room in rooms:
             u_id = room['guid']
@@ -174,6 +169,9 @@ class ConsensusAgent(MetrologicalAgent):
 
 
     def update_reputations(self, buffer_values):
+        if self.reputations is None:
+            for room_id, devices in self.device_map.items():
+                self.reputations = {device: None for device in devices}
         reputation_weights = self.reputations
 
 def building_network_demonstration():
@@ -196,8 +194,13 @@ def building_network_demonstration():
                                          room in [zone['guid'] for zone in building_ser[floor]['zones']]} for floor in
                                  building_ser}
     #%%
-    json.dump(devices_by_room_and_floor, open('Data/devices_by_room_and_floor.json', 'w'))
-    json.dump(building_ser, open('Data/building_ser.json', 'w'))
+    device_pathstring = 'Data/devices_by_room_and_floor.json'
+    if Path(device_pathstring).is_file():
+     json.dump(devices_by_room_and_floor, open(device_pathstring, 'w'))
+
+    ser_pathstring = 'Data/building_ser.json'
+    if Path(ser_pathstring).is_file():
+        json.dump(building_ser, open(ser_pathstring, 'w'))
 
     season_dict = {'20260707_20260713': 'summer', '20260112_20260119': 'winter'}
     room_timeseries = {}
@@ -213,7 +216,8 @@ def building_network_demonstration():
             #
             # df.columns = [re.sub(pattern, replacement, col) for col in df.columns]
             offset_cols = [col for col in df.columns if 'calibration_offset' in col]
-
+            setpoint_cols = [col for col in df.columns if 'setpoint' in col]
+            valve_position_cols = [col for col in df.columns if 'valve_position' in col]
             for offset_col in offset_cols:
                 # 2. Create the measurement column name by removing the offset string.
                 # We include the underscore '_calibration_offset' so we don't leave a trailing underscore behind.
@@ -226,7 +230,7 @@ def building_network_demonstration():
                     print(f"Warning: Could not find matching measurement column for {offset_col}")
 
                     # 2. Drop B
-            df.drop(columns=offset_cols, inplace=True)
+            df.drop(columns=offset_cols+setpoint_cols+valve_position_cols, inplace=True, errors='ignore')
 
             df_dict_internal[season_dict[basename[9:26]]] = df.set_index('timestamp')
         room_timeseries[key] = df_dict_internal
@@ -246,8 +250,10 @@ def building_network_demonstration():
                 room_data = room_timeseries[rname]['winter']
                 platform_agent_dict[rname] = []
                 for device, location in sdict.items():
-                    device_columns = [col for col in room_data.columns if
-                                      device in col or any([loc in col for loc in location])]
+                    device_columns = [col for col in room_data.columns if device in col]
+                    if not device_columns:
+                        device_columns = [col for col in room_data.columns if any(loc in col for loc in location)]
+
                     if device_columns:
                         device_data = room_data[device_columns]
 
