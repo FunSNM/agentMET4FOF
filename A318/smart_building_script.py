@@ -4,6 +4,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from time_series_metadata.scheme import MetaData
+import warnings
 
 from agentMET4FOF.agents import MetrologicalAgent, MetrologicalMonitorAgent
 from agentMET4FOF.network import AgentNetwork
@@ -60,7 +61,8 @@ quantity_unit_map = {'CO': '\mu g/m^3', 'NO': '\mu g/m^3', 'RH': 'percent', 'P':
 class ConsensusAgent(MetrologicalAgent):
     ## Compute the consensus values of measurements
 
-    def init_parameters(self, aggregate_keys=["O3"], consensus_function=np.nanmedian, floor_serialization=None, device_map=None):
+    def init_parameters(self, aggregate_keys=["O3"], consensus_function=np.nanmedian, floor_serialization=None,
+                                                                device_map=None, quantities=['temperature', 'humidity', 'co2']):
         self.aggregate_keys = aggregate_keys
         self.consensus_function = consensus_function
         if type(consensus_function) == str:
@@ -70,10 +72,10 @@ class ConsensusAgent(MetrologicalAgent):
 
         self.floor_serialization = floor_serialization
         self.device_map = device_map
+        self.eligible_devices = self.list_eligible_devices()
         self.connectivity_matrix = self.generate_connectivity_matrix()
 
         self.reputations = None  ## initialise sensor reputations
-
         self.aggregated_values = []
         self.metadata = MetaData(
             device_id="Consensus Agent " + " ".join(self.aggregate_keys),
@@ -100,7 +102,7 @@ class ConsensusAgent(MetrologicalAgent):
         ## check 1: buffer len is the same
         if len(buffer_values) == n_input_agents:
             self.update_connectivity_matrix(buffer_values)
-            self.reputations = self.update_reputations(buffer_values)
+            self.update_reputations(buffer_values)
             self.buffer.clear()
 
     def generate_connectivity_matrix(self):
@@ -142,37 +144,60 @@ class ConsensusAgent(MetrologicalAgent):
 
         for room in rooms:
             u_id = room['guid']
-            sensor_platforms_in_room = [device for device, range in self.device_map[u_id].items() if
+            try:
+                sensor_platforms_in_room = [device for device, range in self.device_map[u_id].items() if
                                         'airvolume' in range]
-            for wall in room.get('walls', []):
-                for neighbour in wall.get('neighbours', []):
-                    v_id = neighbour.get('space_id')
-                    sensor_platforms_in_neighbour = [device for device, range in self.device_map[v_id].items() if
-                                                'airvolume' in range]
 
-                    if v_id in id_to_idx:
-                        # Get the list of doors in this shared wall section [1]
-                        doors = neighbour.get('door_ids_in_section', [])
+                for wall in room.get('walls', []):
+                    for neighbour in wall.get('neighbours', []):
+                        v_id = neighbour.get('space_id')
+                        try:
+                            sensor_platforms_in_neighbour = [device for device, range in self.device_map[v_id].items() if
+                                                        'airvolume' in range]
 
-                        if not doors:
-                            # No door exists, only a shared wall
-                            weight = 0.5
-                        else:
-                            # Door(s) exist. Check the state of the doors.
-                            # If ANY door in the section is open (state != 2), weight is 1.
-                            # If ALL doors in the section are closed (state == 2), weight is 0.5.
-                            is_any_door_open = any(door_states.get(d_id, 0) != 2 for d_id in doors)
-                            weight = 1.0 if is_any_door_open else 0.5
+                            if v_id in id_to_idx:
+                                # Get the list of doors in this shared wall section [1]
+                                doors = neighbour.get('door_ids_in_section', [])
 
-                        self.connectivity_matrix.loc[sensor_platforms_in_room,sensor_platforms_in_neighbour] = weight
-                        self.connectivity_matrix.loc[sensor_platforms_in_neighbour,sensor_platforms_in_room] = weight
+                                if not doors:
+                                    # No door exists, only a shared wall
+                                    weight = 0.5
+                                else:
+                                    # Door(s) exist. Check the state of the doors.
+                                    # If ANY door in the section is open (state != 2), weight is 1.
+                                    # If ALL doors in the section are closed (state == 2), weight is 0.5.
+                                    is_any_door_open = any(door_states.get(d_id, 0) != 2 for d_id in doors)
+                                    weight = 1.0 if is_any_door_open else 0.5
+
+                                self.connectivity_matrix.loc[sensor_platforms_in_room,sensor_platforms_in_neighbour] = weight
+                                self.connectivity_matrix.loc[sensor_platforms_in_neighbour,sensor_platforms_in_room] = weight
+                        except KeyError:
+                            print(f"Warning: Device map not found for room {v_id}")
+            except KeyError:
+                print(f"Warning: device map not found for room {u_id}")
 
 
     def update_reputations(self, buffer_values):
         if self.reputations is None:
-            for room_id, devices in self.device_map.items():
-                self.reputations = {device: None for device in devices}
-        reputation_weights = self.reputations
+            self.reputations = pd.DataFrame()
+            for buffer_value in buffer_values:
+                platform_name = buffer_value['metadata'][0]._metadata['misc'].split(' ')[1]
+                quantities_and_reputations = {mdata._metadata['device_id'].split('__')[1]: 1 for mdata in
+                                              buffer_value['metadata']}
+                if platform_name in self.eligible_devices:
+                    self.reputations[platform_name] = quantities_and_reputations
+        else:
+            for reputation_row in self.reputations.iterrows():
+                for connectivity_row in self.connectivity_matrix.iterrows():
+                    reputation_weights = reputation_row[1] * connectivity_row[1]
+
+
+    def list_eligible_devices(self):
+        eligible_devices = []
+        for room_id, devices in self.device_map.items():
+            eligible_devices.extend([device for device, range in devices.items() if 'airvolume' in range])
+
+        return eligible_devices
 
 def building_network_demonstration():
     agent_network = AgentNetwork(dashboard_modules=True, backend=Backend.MESA)
