@@ -155,6 +155,7 @@ commands:
           name: Run tests
           command: |
             tox | tee --append test-results/agentMET4FOF.log
+          no_output_timeout: 15m
       - store_test_artifacts_and_results
 
   store_test_artifacts_and_results:
@@ -226,8 +227,7 @@ jobs:
     steps:
       - add_ssh_keys:
           fingerprints:
-            - "41:e2:e1:e7:a9:a3:8d:62:d9:19:6f:71:fe:f6:20:c1"
-            - "jW7ito3wfAqfwDSwQsAM+jI5BG6HX5JhRyTm3C9kPFo"
+            - "SHA256:FEspuMGAO72bH9I0QQoiJrVUoxj+9HqkciG4DegrHLQ"
       - checkout
       - attach_workspace:
           at: .
@@ -244,7 +244,7 @@ jobs:
       - run:
           name: Commit and push changes
           command: |
-            git config --global user.name "anupam-prasad"
+            git config --global user.name "Circle CI Bot"
             git config --global user.email "anupam.13@gmail.com"
             git commit -am \
               "build(deps): recompile Python (dev) deps on $(date)"
@@ -361,7 +361,7 @@ jobs:
               CI_PULL_REQUESTS
             export CIRCLE_BRANCH=develop
             git config --global user.name "semantic-release (via CircleCI)"
-            git config --global user.email "bjoern.ludwig@ptb.de"
+            git config --global user.email "anupam.13@gmail.com"
             echo "
             The changelog of the next release will contain:
             "
@@ -379,14 +379,14 @@ jobs:
     steps:
       - add_ssh_keys:
           fingerprints:
-            - "41:e2:e1:e7:a9:a3:8d:62:d9:19:6f:71:fe:f6:20:c1"
+            - "SHA256:FEspuMGAO72bH9I0QQoiJrVUoxj+9HqkciG4DegrHLQ"
       - checkout
       - install_all_deps
       - run:
           name: Run semantic-release publish
           command: |
-            git config --global user.name "semantic-release (via CircleCI)"
-            git config --global user.email "bjoern.ludwig@ptb.de"
+            git config --global user.name "CircleCI Bot"
+            git config --global user.email "anupam.13@gmail.com"
             semantic-release publish
 
   build_image:
