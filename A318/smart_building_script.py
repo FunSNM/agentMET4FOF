@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 from time_series_metadata.scheme import MetaData
 import warnings
+from collections import defaultdict
 
 from agentMET4FOF.agents import MetrologicalAgent, MetrologicalMonitorAgent
 from agentMET4FOF.network import AgentNetwork
@@ -61,14 +62,14 @@ quantity_unit_map = {'CO': '\mu g/m^3', 'NO': '\mu g/m^3', 'RH': 'percent', 'P':
 class ConsensusAgent(MetrologicalAgent):
     ## Compute the consensus values of measurements
 
-    def init_parameters(self, aggregate_keys=["O3"], consensus_function=np.nanmedian, floor_serialization=None,
-                                                                device_map=None, quantities=['temperature', 'humidity', 'co2']):
-        self.aggregate_keys = aggregate_keys
+    def init_parameters(self, floor_name=None, consensus_function=np.nanmedian, floor_serialization=None,
+                        device_map=None, quantities=['temperature', 'humidity', 'co2']):
+        self.floor_name = floor_name
         self.consensus_function = consensus_function
         if type(consensus_function) == str:
-            self.agg_function_name = consensus_function
+            self.consensus_function_name = consensus_function
         else:
-            self.agg_function_name =  consensus_function.__name__
+            self.consensus_function_name =  consensus_function.__name__
 
         self.floor_serialization = floor_serialization
         self.device_map = device_map
@@ -78,12 +79,12 @@ class ConsensusAgent(MetrologicalAgent):
         self.reputations = None  ## initialise sensor reputations
         self.aggregated_values = []
         self.metadata = MetaData(
-            device_id="Consensus Agent " + " ".join(self.aggregate_keys),
+            device_id="Consensus Agent " + " ".join(self.floor_name),
             time_name='timestamp',
             time_unit='h',
-            quantity_names=self.agg_function_name + " " + " ".join(self.aggregate_keys),
+            quantity_names=self.consensus_function_name + " " + " ".join(self.floor_name),
             quantity_units="\mu g/ m^3",
-            misc="Consensus values "+" ".join(self.aggregate_keys)+ "in floor "+ f"{floor_serialization['floor']:02d}",
+            misc="Consensus values " +" ".join(self.floor_name) + "in floor " + f"{floor_serialization['floor']:02d}",
         )
         super().init_parameters()
 
@@ -142,54 +143,115 @@ class ConsensusAgent(MetrologicalAgent):
         room_ids = sorted([room['guid'] for room in rooms])
         id_to_idx = {room_id: i for i, room_id in enumerate(room_ids)}
 
+        room_to_sensors = {
+            u_id: [dev for dev, rng in devices.items() if 'airvolume' in rng]
+            for u_id, devices in self.device_map.items()
+        }
+
+        # Use a list to collect updates to avoid calling .loc in a loop
+        # Format: (row_sensors, col_sensors, weight)
+        updates = []
+
         for room in rooms:
-            u_id = room['guid']
-            try:
-                sensor_platforms_in_room = [device for device, range in self.device_map[u_id].items() if
-                                        'airvolume' in range]
+            u_id = room.get('guid')
+            u_sensors = room_to_sensors.get(u_id, [])
 
-                for wall in room.get('walls', []):
-                    for neighbour in wall.get('neighbours', []):
-                        v_id = neighbour.get('space_id')
-                        try:
-                            sensor_platforms_in_neighbour = [device for device, range in self.device_map[v_id].items() if
-                                                        'airvolume' in range]
+            if not u_sensors:
+                continue
 
-                            if v_id in id_to_idx:
-                                # Get the list of doors in this shared wall section [1]
-                                doors = neighbour.get('door_ids_in_section', [])
+            for wall in room.get('walls', []):
+                for neighbour in wall.get('neighbours', []):
+                    v_id = neighbour.get('space_id')
 
-                                if not doors:
-                                    # No door exists, only a shared wall
-                                    weight = 0.5
-                                else:
-                                    # Door(s) exist. Check the state of the doors.
-                                    # If ANY door in the section is open (state != 2), weight is 1.
-                                    # If ALL doors in the section are closed (state == 2), weight is 0.5.
-                                    is_any_door_open = any(door_states.get(d_id, 0) != 2 for d_id in doors)
-                                    weight = 1.0 if is_any_door_open else 0.5
+                    # Skip if v_id is invalid or not in our target index
+                    if v_id not in id_to_idx:
+                        continue
 
-                                self.connectivity_matrix.loc[sensor_platforms_in_room,sensor_platforms_in_neighbour] = weight
-                                self.connectivity_matrix.loc[sensor_platforms_in_neighbour,sensor_platforms_in_room] = weight
-                        except KeyError:
-                            print(f"Warning: Device map not found for room {v_id}")
-            except KeyError:
-                print(f"Warning: device map not found for room {u_id}")
+                    v_sensors = room_to_sensors.get(v_id, [])
+                    if not v_sensors:
+                        continue
 
+                    # 2. Simplify Weight Logic
+                    doors = neighbour.get('door_ids_in_section', [])
+                    if not doors:
+                        weight = 0.5
+                    else:
+                        # Weight is 1.0 if ANY door is open (state != 2), else 0.5
+                        weight = 1.0 if any(door_states.get(d_id, 0) != 2 for d_id in doors) else 0.25
 
-    def update_reputations(self, buffer_values):
+                    updates.append((u_sensors, v_sensors, weight))
+
+        # 3. Batch update the DataFrame
+        for u_sens, v_sens, weight in updates:
+            self.connectivity_matrix.loc[u_sens, v_sens] = weight
+            self.connectivity_matrix.loc[v_sens, u_sens] = weight
+
+    def update_reputations(self, buffer_values, update_rate = 0.1):
+        """
+        Check if reputations have already been assigned. If not assign reputation "1" to all sensors.
+
+        Else update reputations based on sensor readings and connectivity matrix. Only "participating"
+        sensors are updated. i.e. Sensors not connected to any others, eg. via an open door or wall,
+        retain their previous reputation values.
+
+        :param buffer_values:
+        """
         if self.reputations is None:
-            self.reputations = pd.DataFrame()
+            reputation_data = {}
+
             for buffer_value in buffer_values:
-                platform_name = buffer_value['metadata'][0]._metadata['misc'].split(' ')[1]
-                quantities_and_reputations = {mdata._metadata['device_id'].split('__')[1]: 1 for mdata in
-                                              buffer_value['metadata']}
+                metadata_list = buffer_value.get('metadata', [])
+                if not metadata_list:
+                    continue
+
+                # Extract platform name from the first metadata element
+                try:
+                    misc_info = metadata_list[0]._metadata.get('misc', '')
+                    platform_name = misc_info.split(' ')[1]
+                except (IndexError, AttributeError):
+                    continue
+
                 if platform_name in self.eligible_devices:
-                    self.reputations[platform_name] = quantities_and_reputations
+                    # 2. Use a dictionary comprehension to build the device map
+                    # Only create this if we actually need it for an eligible device
+                    device_reputations = {
+                        mdata._metadata['device_id'].split('__')[1]: 1
+                        for mdata in metadata_list
+                        if hasattr(mdata, '_metadata')
+                    }
+                    reputation_data[platform_name] = device_reputations
+
+            # 3. Create the DataFrame once at the end
+            # Pandas handles a dict-of-dicts perfectly:
+            # Outer keys = columns, Inner keys = index (rows)
+            self.reputations = pd.DataFrame(reputation_data, dtype=np.float)
         else:
+            sensor_readings_dict = defaultdict(dict)
+
+            for buffer_value in buffer_values:
+                for mdata, sdata in zip(buffer_value['metadata'], buffer_value['data']):
+                    # Extract keys for readability
+                    platform_key = mdata.metadata['misc'].split(' ')[-1]
+                    reading_key = mdata.metadata['device_id'].split('__')[1]
+                    measurement = float(sdata[2])
+                    unc = float(sdata[3])
+
+                    # This updates the inner dict instead of overwriting the outer one
+                    if platform_key in self.eligible_devices:
+                        sensor_readings_dict[platform_key][reading_key] = measurement
+
+            sensor_readings = pd.DataFrame(sensor_readings_dict)
             for reputation_row in self.reputations.iterrows():
+                local_consensus = []
+                sensor_reading_type = reputation_row[1].name
+                sensor_readings_row = sensor_readings.loc[sensor_reading_type]
                 for connectivity_row in self.connectivity_matrix.iterrows():
                     reputation_weights = reputation_row[1] * connectivity_row[1]
+                    local_consensus.append(np.sum(reputation_weights * sensor_readings_row) / np.sum(reputation_weights))
+                local_consensus = np.array(local_consensus)
+                sensor_deviations = np.abs(np.array(local_consensus) - sensor_readings.loc[sensor_reading_type].to_numpy())
+                reputation_change = update_rate * (np.exp(-sensor_deviations) - 0.5)
+                self.reputations.loc[sensor_reading_type] = np.clip(reputation_row[1] + reputation_change, 0, 1)
 
 
     def list_eligible_devices(self):
@@ -265,7 +327,7 @@ def building_network_demonstration():
     platform_agent_dict = {}
     for floor in building_ser:
         floor_agents[floor] = agent_network.add_agent(name="Consensus Agent " + floor, agentType=ConsensusAgent,
-                                                      aggregate_keys='temperature',
+                                                      floor_name=floor,
                                                       floor_serialization=building_ser[floor], device_map=devices_by_room_and_floor[floor],
                                                       buffer_size=20)
         for zone in building_ser[floor]['zones']:
