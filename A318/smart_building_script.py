@@ -1,11 +1,11 @@
+import itertools
 import json
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from time_series_metadata.scheme import MetaData
-import warnings
-from collections import defaultdict
 
 from agentMET4FOF.agents import MetrologicalAgent, MetrologicalMonitorAgent
 from agentMET4FOF.network import AgentNetwork
@@ -14,50 +14,6 @@ from agentMET4FOF.utils import Backend
 
 quantity_unit_map = {'CO': '\mu g/m^3', 'NO': '\mu g/m^3', 'RH': 'percent', 'P': 'kPA', 'NO2': '\mu g/m^3',
                      'O3': '\mu g/m^3', 'PM10':'\mu g/m^3', 'PM25': '\mu g/m^3', 'T': '°C'}
-
-# class OfficeRoomAgent(MetrologicalAgent):
-#     """An agent representing a single room in a building streaming multiple signals corresponding
-#     to the sensors placed inside the room.
-#
-#     Takes samples from a list of :py:mod:`Sensor` and pushes them sample by sample
-#     to connected agents via its output channel.
-#     """
-#
-#     def init_parameters(self, room_name: str = None, room_devices_dict: dict = None, room_data: pd.DataFrame = None, **kwargs):
-#         """Initialize the input data
-#
-#         Initialize the input data stream(s) as an instances of the
-#         :param room_name:
-#         :param **kwargs:
-#         :py:mod:`Sensor` class
-#         """
-#         self.sensor_platforms = []
-#         self.room_name = room_name
-#         # for key, val in room_devices_dict.items():
-#         #     sensor_cols = [mystring for mystring in room_data.columns if (key in mystring or val[0] in mystring)]
-#         for device, location  in room_devices_dict.items():
-#             device_columns = [col for col in room_data.columns if device in col or any([loc in col for loc in location])]
-#             device_data = room_data[device_columns]
-#             self.sensor_platforms.append(SensorPlatform(platform_timeseries=device_data, platform_id=device))
-#         super().init_parameters()
-#
-#     def agent_loop(self):
-#         """Model the agent's behaviour
-#
-#         On state *Running* the agent will extract sample by sample the input data
-#         streams content and push it via invoking :py:method:`AgentMET4FOF.send_output`.
-#         """
-#         if self.current_state == "Running":
-#             # sine_data = self.sine_stream.next_sample()  # dictionary
-#             # self.send_output(sine_data["quantities"])
-#             for platform in self.sensor_platforms:
-#                 platform.agent_loop()
-#             super().agent_loop()
-#
-#     def n_sensors(self):
-#         """Return the number of sensors in the room."""
-#         return len(self.sensors)
-
 
 class ConsensusAgent(MetrologicalAgent):
     ## Compute the consensus values of measurements
@@ -77,7 +33,6 @@ class ConsensusAgent(MetrologicalAgent):
         self.connectivity_matrix = self.generate_connectivity_matrix()
 
         self.reputations = None  ## initialise sensor reputations
-        self.aggregated_values = []
         self.metadata = MetaData(
             device_id="Consensus Agent " + " ".join(self.floor_name),
             time_name='timestamp',
@@ -104,6 +59,15 @@ class ConsensusAgent(MetrologicalAgent):
         if len(buffer_values) == n_input_agents:
             self.update_connectivity_matrix(buffer_values)
             self.update_reputations(buffer_values)
+            reputation_timestamp = self.reputations['timestamp']
+            for reputation_row in self.reputations['reputations'].iterrows():
+                packed_reputations = [self.send_output(data=[np.array([[reputation_timestamp, 0, val, 0]]), MetaData(
+                    device_id=idx,
+                    time_name='timestamp',
+                    time_unit='h',
+                    quantity_names=reputation_row[0],
+                    quantity_units="\mu g/ m^3",
+                )], channel="default") for idx, val in reputation_row[1].items()]
             self.buffer.clear()
 
     def generate_connectivity_matrix(self):
@@ -177,7 +141,7 @@ class ConsensusAgent(MetrologicalAgent):
                         weight = 0.5
                     else:
                         # Weight is 1.0 if ANY door is open (state != 2), else 0.5
-                        weight = 1.0 if any(door_states.get(d_id, 0) != 2 for d_id in doors) else 0.25
+                        weight = 1.0 if any(door_states.get(d_id, 0) != 2 for d_id in doors) else 0.00
 
                     updates.append((u_sensors, v_sensors, weight))
 
@@ -224,10 +188,12 @@ class ConsensusAgent(MetrologicalAgent):
             # 3. Create the DataFrame once at the end
             # Pandas handles a dict-of-dicts perfectly:
             # Outer keys = columns, Inner keys = index (rows)
-            self.reputations = pd.DataFrame(reputation_data, dtype=np.float)
+            reputation_timestamp = self.reputation_timestamp(buffer_values)
+            self.reputations = {'timestamp': reputation_timestamp, 'reputations': pd.DataFrame(reputation_data, dtype=float)}
         else:
             sensor_readings_dict = defaultdict(dict)
-
+            sensor_uncertainties_dict = defaultdict(dict)
+            #Retrieve sensor readings and timestamp from buffer values
             for buffer_value in buffer_values:
                 for mdata, sdata in zip(buffer_value['metadata'], buffer_value['data']):
                     # Extract keys for readability
@@ -239,19 +205,23 @@ class ConsensusAgent(MetrologicalAgent):
                     # This updates the inner dict instead of overwriting the outer one
                     if platform_key in self.eligible_devices:
                         sensor_readings_dict[platform_key][reading_key] = measurement
+                        sensor_uncertainties_dict[platform_key][reading_key] = unc
 
             sensor_readings = pd.DataFrame(sensor_readings_dict)
-            for reputation_row in self.reputations.iterrows():
-                local_consensus = []
-                sensor_reading_type = reputation_row[1].name
-                sensor_readings_row = sensor_readings.loc[sensor_reading_type]
-                for connectivity_row in self.connectivity_matrix.iterrows():
-                    reputation_weights = reputation_row[1] * connectivity_row[1]
-                    local_consensus.append(np.sum(reputation_weights * sensor_readings_row) / np.sum(reputation_weights))
-                local_consensus = np.array(local_consensus)
-                sensor_deviations = np.abs(np.array(local_consensus) - sensor_readings.loc[sensor_reading_type].to_numpy())
-                reputation_change = update_rate * (np.exp(-sensor_deviations) - 0.5)
-                self.reputations.loc[sensor_reading_type] = np.clip(reputation_row[1] + reputation_change, 0, 1)
+            sensor_uncertainties = pd.DataFrame(sensor_uncertainties_dict)
+            reputation_timestamp = self.reputation_timestamp(buffer_values)
+            self.reputations['timestamp'] = reputation_timestamp
+
+            #update reputations based on sensor readings
+            for reputation_row in self.reputations['reputations'].iterrows():
+                sensor_reading_type = reputation_row[0]
+                eligible_platforms = reputation_row[1].index[reputation_row[1].notna()]
+                sensor_readings_row = sensor_readings.loc[sensor_reading_type].loc[eligible_platforms]
+                reputation_weights = self.connectivity_matrix.mul(reputation_row[1], axis=0).loc[eligible_platforms][eligible_platforms]
+                local_consensus = reputation_weights.mul(sensor_readings_row, axis=0).sum(axis=0) / reputation_weights.sum(axis=0)
+                sensor_deviations = np.abs(local_consensus - sensor_readings_row)
+                reputation_change = sensor_deviations.combine(local_consensus, lambda x, y: update_rate*(np.exp(-x/y)-0.5))
+                self.reputations['reputations'].loc[sensor_reading_type,eligible_platforms] = np.clip(reputation_row[1] + reputation_change, 0, 1)
 
 
     def list_eligible_devices(self):
@@ -260,6 +230,11 @@ class ConsensusAgent(MetrologicalAgent):
             eligible_devices.extend([device for device, range in devices.items() if 'airvolume' in range])
 
         return eligible_devices
+
+    def reputation_timestamp(self, buffer_values):
+        tstamps = [np.ravel(buffer_value['data'][:, 0]).tolist() for buffer_value in buffer_values]
+        reputation_timestamp = set(list(itertools.chain.from_iterable(tstamps)))
+        return reputation_timestamp
 
 def building_network_demonstration():
     agent_network = AgentNetwork(dashboard_modules=True, backend=Backend.MESA)
@@ -325,7 +300,7 @@ def building_network_demonstration():
     floor_agents = {}
     monitor_agents = {}
     platform_agent_dict = {}
-    for floor in building_ser:
+    for floor in ['F01']:
         floor_agents[floor] = agent_network.add_agent(name="Consensus Agent " + floor, agentType=ConsensusAgent,
                                                       floor_name=floor,
                                                       floor_serialization=building_ser[floor], device_map=devices_by_room_and_floor[floor],
@@ -355,7 +330,7 @@ def building_network_demonstration():
 
 
         monitor_agents[floor] = agent_network.add_agent(name="Monitor Agent " + floor,
-                                                        agentType=MetrologicalMonitorAgent)
+                                                        agentType=MetrologicalMonitorAgent, buffer_size=50)
 
         floor_agents[floor].bind_output(monitor_agents[floor])
 
