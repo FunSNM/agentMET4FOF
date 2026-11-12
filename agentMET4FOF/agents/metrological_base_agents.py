@@ -32,7 +32,7 @@ class MetrologicalAgent(AgentMET4FOF):
     """
     _output_data_maxlen: int
 
-    def init_parameters(self, input_data_maxlen=25, output_data_maxlen=25):
+    def init_parameters(self, input_data_maxlen: int = 25, output_data_maxlen:int = 25) -> None:
         super(MetrologicalAgent, self).init_parameters()
         self._input_data = {}
         self._input_data_maxlen = input_data_maxlen
@@ -71,16 +71,21 @@ class MetrologicalAgent(AgentMET4FOF):
         # create storage for new output channels
         if channel not in self._output_data.keys():
             self._output_data[channel] = {
-                "metadata": metadata,
+                # Initialize metadata as a list.
+                # If metadata is None, start with an empty list.
+                "metadata": [metadata] if metadata is not None else [],
                 "buffer": TimeSeriesBuffer(maxlen=self._output_data_maxlen),
             }
+        # 2. Append metadata if provided
+        elif metadata is not None:
+            # Since we guaranteed metadata is a list during initialization,
+            # we can safely call .append() after checking if identical metadata object is not already present
+            # to avoid resending metadata
+            if metadata not in self._output_data[channel]["metadata"]:
+                self._output_data[channel]["metadata"].append(metadata)
 
-        if metadata is not None:
-            # update received metadata
-            self._output_data[channel]["metadata"] = metadata
-
+        # 3. Append received data
         if data is not None:
-            # append received data
             self._output_data[channel]["buffer"].add(data=data)
 
     def agent_loop(self):
@@ -98,6 +103,8 @@ class MetrologicalAgent(AgentMET4FOF):
 
                     # send data+metadata
                     self.send_output([data, metadata], channel=channel)
+
+        super().agent_loop()
 
     def pack_data(self, data, channel="default"):
 
@@ -205,6 +212,7 @@ class MetrologicalMonitorAgent(MetrologicalAgent):
                     error_y=dict(type="data", array=uv, visible=True),
                     mode="lines",
                     name=f"{y_label} ({sender_agent})",
+                    line=dict(width=5),
                 )
             else:
                 trace = go.Scatter()
