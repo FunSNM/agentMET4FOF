@@ -19,7 +19,7 @@ class ConsensusAgent(MetrologicalAgent):
     ## Compute the consensus values of measurements
 
     def init_parameters(self, floor_name=None, consensus_function=np.nanmedian, floor_serialization=None,
-                        device_map=None, quantities=['temperature', 'humidity', 'co2']):
+                        device_map=None, quantities=['temperature', 'humidity', 'co2'], update_rate = 0.1):
         self.floor_name = floor_name
         self.consensus_function = consensus_function
         if type(consensus_function) == str:
@@ -29,8 +29,9 @@ class ConsensusAgent(MetrologicalAgent):
 
         self.floor_serialization = floor_serialization
         self.device_map = device_map
-        self.eligible_devices = self.list_eligible_devices()
-        self.connectivity_matrix = self.generate_connectivity_matrix()
+        self.eligible_devices = self._list_eligible_devices()
+        self.connectivity_matrix = self._generate_base_connectivity_matrix()
+        self.update_rate = update_rate
 
         self.reputations = None  ## initialise sensor reputations
         self.metadata = MetaData(
@@ -60,17 +61,17 @@ class ConsensusAgent(MetrologicalAgent):
             self.update_connectivity_matrix(buffer_values)
             self.update_reputations(buffer_values)
             reputation_timestamp = self.reputations['timestamp']
-            for reputation_row in self.reputations['reputations'].iterrows():
+            for meastype, reputation_row in self.reputations['reputations'].items():
                 packed_reputations = [self.send_output(data=[np.array([[reputation_timestamp, 0, val, 0]]), MetaData(
                     device_id=idx,
                     time_name='timestamp',
                     time_unit='h',
-                    quantity_names=reputation_row[0],
-                    quantity_units="\mu g/ m^3",
-                )], channel="default") for idx, val in reputation_row[1].items()]
+                    quantity_names=meastype,
+                    quantity_units="None",
+                )], channel="default") for idx, val in reputation_row.items()]
             self.buffer.clear()
 
-    def generate_connectivity_matrix(self):
+    def _generate_base_connectivity_matrix(self):
 
         connectivity_matrix = None
         sensor_platforms = []
@@ -95,7 +96,7 @@ class ConsensusAgent(MetrologicalAgent):
         #gather door states: 0 if closed, 2 if open
         for buffer_value in buffer_values:
             quant_and_platform_names = [(mdata._metadata['device_id'], mdata._metadata['misc'])  for mdata in buffer_value['metadata']]
-            doornames = [qp[1].split(' ')[1]+'_'+qp[0][:5]
+            doornames = [qp[1].split(' ')[1]
                          for qp in quant_and_platform_names if 'door' in qp[0]]
             door_indices = [i for i, s in enumerate(quant_and_platform_names) if "door" in s[0]]
             door_states.update({dname:buffer_value['data'][ind][2].astype(int) for dname, ind in zip(doornames, door_indices)})
@@ -138,10 +139,10 @@ class ConsensusAgent(MetrologicalAgent):
                     # 2. Simplify Weight Logic
                     doors = neighbour.get('door_ids_in_section', [])
                     if not doors:
-                        weight = 0.5
+                        weight = 0.25
                     else:
                         # Weight is 1.0 if ANY door is open (state != 2), else 0.5
-                        weight = 1.0 if any(door_states.get(d_id, 0) != 2 for d_id in doors) else 0.00
+                        weight = 1.0 if any(door_states.get(self._get_pname(d_id), 0) == 2 for d_id in doors) else 0.25
 
                     updates.append((u_sensors, v_sensors, weight))
 
@@ -150,7 +151,7 @@ class ConsensusAgent(MetrologicalAgent):
             self.connectivity_matrix.loc[u_sens, v_sens] = weight
             self.connectivity_matrix.loc[v_sens, u_sens] = weight
 
-    def update_reputations(self, buffer_values, update_rate = 0.1):
+    def update_reputations(self, buffer_values):
         """
         Check if reputations have already been assigned. If not assign reputation "1" to all sensors.
 
@@ -161,7 +162,7 @@ class ConsensusAgent(MetrologicalAgent):
         :param buffer_values:
         """
         if self.reputations is None:
-            reputation_data = {}
+            reputation_data = defaultdict(dict)
 
             for buffer_value in buffer_values:
                 metadata_list = buffer_value.get('metadata', [])
@@ -175,21 +176,18 @@ class ConsensusAgent(MetrologicalAgent):
                 except (IndexError, AttributeError):
                     continue
 
+
                 if platform_name in self.eligible_devices:
-                    # 2. Use a dictionary comprehension to build the device map
-                    # Only create this if we actually need it for an eligible device
-                    device_reputations = {
-                        mdata._metadata['device_id'].split('__')[1]: 1
-                        for mdata in metadata_list
-                        if hasattr(mdata, '_metadata')
-                    }
-                    reputation_data[platform_name] = device_reputations
+                    for mdata in metadata_list:
+                        if hasattr(mdata, '_metadata'):
+                            device_id = mdata._metadata['device_id'].split('__')[1]
+                            reputation_data[device_id][platform_name] = 1
 
             # 3. Create the DataFrame once at the end
             # Pandas handles a dict-of-dicts perfectly:
             # Outer keys = columns, Inner keys = index (rows)
-            reputation_timestamp = self.reputation_timestamp(buffer_values)
-            self.reputations = {'timestamp': reputation_timestamp, 'reputations': pd.DataFrame(reputation_data, dtype=float)}
+            reputation_timestamp = self._reputation_timestamp(buffer_values)
+            self.reputations = {'timestamp': reputation_timestamp, 'reputations': {device: pd.Series(reputations) for device, reputations in reputation_data.items()}}
         else:
             sensor_readings_dict = defaultdict(dict)
             sensor_uncertainties_dict = defaultdict(dict)
@@ -209,32 +207,41 @@ class ConsensusAgent(MetrologicalAgent):
 
             sensor_readings = pd.DataFrame(sensor_readings_dict)
             sensor_uncertainties = pd.DataFrame(sensor_uncertainties_dict)
-            reputation_timestamp = self.reputation_timestamp(buffer_values)
-            self.reputations['timestamp'] = reputation_timestamp
+
+            self.reputations['timestamp'] = self._reputation_timestamp(buffer_values)
 
             #update reputations based on sensor readings
-            for reputation_row in self.reputations['reputations'].iterrows():
-                sensor_reading_type = reputation_row[0]
-                eligible_platforms = reputation_row[1].index[reputation_row[1].notna()]
-                sensor_readings_row = sensor_readings.loc[sensor_reading_type].loc[eligible_platforms]
-                reputation_weights = self.connectivity_matrix.mul(reputation_row[1], axis=0).loc[eligible_platforms][eligible_platforms]
+            for sensor_reading_type, reputation_row in self.reputations['reputations'].items():
+                sensor_readings_row = sensor_readings.loc[sensor_reading_type,reputation_row.index]
+                reputation_weights = self.connectivity_matrix.loc[reputation_row.index, reputation_row.index].mul(reputation_row, axis=0)
                 local_consensus = reputation_weights.mul(sensor_readings_row, axis=0).sum(axis=0) / reputation_weights.sum(axis=0)
-                sensor_deviations = np.abs(local_consensus - sensor_readings_row)
-                reputation_change = sensor_deviations.combine(local_consensus, lambda x, y: update_rate*(np.exp(-x/y)-0.5))
-                self.reputations['reputations'].loc[sensor_reading_type,eligible_platforms] = np.clip(reputation_row[1] + reputation_change, 0, 1)
+                self.reputations['reputations'][sensor_reading_type] *= self._reputation_change_factor(sensor_readings_row, local_consensus)
 
+    def _reputation_change_factor(self, sensor_readings, local_consensus, NaN_change_factor=0.9):
+        sensor_deviations = np.abs(local_consensus - sensor_readings)
+        reputation_change = sensor_deviations.combine(local_consensus,
+                                                      lambda x, y: (np.exp(-25*x**2 / y**2)))
+        rep_change_factor = self.update_rate + (1 - self.update_rate) * reputation_change
+        return rep_change_factor.fillna(NaN_change_factor)
 
-    def list_eligible_devices(self):
+    def _list_eligible_devices(self):
         eligible_devices = []
         for room_id, devices in self.device_map.items():
             eligible_devices.extend([device for device, range in devices.items() if 'airvolume' in range])
 
         return eligible_devices
 
-    def reputation_timestamp(self, buffer_values):
+    def _reputation_timestamp(self, buffer_values):
         tstamps = [np.ravel(buffer_value['data'][:, 0]).tolist() for buffer_value in buffer_values]
         reputation_timestamp = set(list(itertools.chain.from_iterable(tstamps)))
         return reputation_timestamp
+
+    def _get_pname(self, d_id):
+        "Retrieve door sensor platform names from room id"
+        room_devices = self.device_map.get(d_id[:7], {})
+        target_val = [d_id.split('_')[2]]
+        # Find the first key that matches the value
+        return next((k for k, v in room_devices.items() if v == target_val), None)
 
 def building_network_demonstration():
     agent_network = AgentNetwork(dashboard_modules=True, backend=Backend.MESA)
@@ -309,7 +316,7 @@ def building_network_demonstration():
             rname = zone['guid']
             try:
                 sdict = device_maps[rname]
-                room_data = room_timeseries[rname]['winter']
+                room_data = room_timeseries[rname]['summer']
                 platform_agent_dict[rname] = []
                 for device, location in sdict.items():
                     device_columns = [col for col in room_data.columns if device in col]
